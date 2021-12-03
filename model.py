@@ -1,12 +1,15 @@
 """
+https://github.com/lihe07/pytorch-hourglass/
+
 StackedHourglass 模型实现
 # With annotations
-
 By @lihe07 2021.11.22
 """
 
 import torch
 from torch import nn
+
+from icecream import ic
 
 
 # Concepts
@@ -31,7 +34,7 @@ def make_relu_conv(in_channels, out_channels, kernel_size=1, stride=1, padding=0
     return nn.Sequential(
         nn.BatchNorm2d(in_channels),
         nn.Conv2d(in_channels, out_channels, (kernel_size, kernel_size), (stride, stride), padding),
-        nn.ReLU()
+        nn.ReLU(inplace=True)
     )
 
 
@@ -42,7 +45,6 @@ def make_conv_group(in_channels, out_channels):
     -> ReluConv(size=1, stride=1, padding=0) -> Data [x, y, out_channels//2]
     -> ReluConv(size=3, stride=1, padding=1) -> Data [x, y, out_channels//2]
     -> ReluConv(size=1, stride=1, padding=0) -> Data [x, y, out_channels]
-
     :param in_channels: 输入的通道数量
     :param out_channels: 输出通道数量
     :return: 一个Sequential 包含三个ReluConv
@@ -63,7 +65,6 @@ def make_channel_controller(in_channels, out_channels):
     制造一个通道调节器
     Data [x, y, in_channels]
     -> Conv(size=1, stride=1, padding=0) -> Data [x, y, out_channels]
-
     :param in_channels: 输入的通道数量
     :param out_channels: 输出的通道数量
     :return: 一个Sequential 可能包含一个Conv
@@ -89,6 +90,7 @@ class ResBlock(nn.Module):
     def forward(self, x):
         # print("输入x的shape为", x.shape)
         # print("输入的channel应为", self.inc)
+
         return self.conv(x) + self.skip(x)
 
 
@@ -98,7 +100,6 @@ def make_res_block(in_channels, out_channels):
     Data [x, y, in_channels] -> ChannelController() -
     |                                               |
     -> ConvBlock() -> Data [x, y, out_channels] -> (+) -> Data [x, y, out_channels]
-
     :param in_channels: 输入的通道数量
     :param out_channels: 输出的通道数量
     :return: 一个nn.Module 内含一个残差模块
@@ -124,6 +125,9 @@ def make_enlarger(zoom_factor):
     |  *  |  => |    *  *    |
     -------     |    *  *    |
                 --------------
+
+    Wout = Win * zoom_factor
+    Hout = Hin * zoom_factor
     :param zoom_factor: 放大倍数
     :return: 一个nn.Module 用于放大图片
     """
@@ -174,7 +178,6 @@ skip |   -> [ res_block(channels, channels) * n ]
     def __init__(self, channels, group_res_num, nesting_times, pool_kernel=2, pool_stride=2, enlarger_kernel=2):
         """
         构造一个大沙漏模型
-
         :param channels: 输入==输出通道数量
         :param group_res_num: 一窝残差包含的残差Conv数量
         :param nesting_times: 递归套娃多少个沙漏
@@ -189,7 +192,7 @@ skip |   -> [ res_block(channels, channels) * n ]
 
         # 制造主线
         self.main_route = nn.Sequential(
-            nn.MaxPool2d(pool_kernel, pool_stride),
+            nn.MaxPool2d(kernel_size=pool_kernel, stride=pool_stride),
             make_res_group(channels, group_res_num),
 
             # 分支1: 如果还有递归次数
@@ -208,6 +211,20 @@ skip |   -> [ res_block(channels, channels) * n ]
         )
 
     def forward(self, x):
+        # 每次Nesting会导致size的W和H减半
+        assert x.shape[2] % 2 == 0 and x.shape[3] % 2 == 0, RuntimeError(
+            f"每次Nesting都会导致高度和宽度减半, 目前输入的高度和宽度 {x.shape[3]} {x.shape[2]} 无法被2整除")
+        # x = self.main_route(x)
+        # s = self.skipper(x)
+        # ic(x.shape, s.shape)
+        # if x.shape != s.shape:
+        #     ic(x.shape, s.shape)
+        #     x = nn.Upsample((
+        #         s.shape[2],
+        #         s.shape[3]
+        #     ))(x) + s
+        # else:
+        #     x = x + s
         return self.main_route(x) + self.skipper(x)
 
 
@@ -220,8 +237,6 @@ class ConnectedHourglass(nn.Module):
         -> res_block(128, 128)
         -> res_block(128, channels)
         -> Data [channels]
-
-
     # 开始循环
     # 单个循环结
     Data [channels] -> Hourglass
@@ -237,7 +252,6 @@ class ConnectedHourglass(nn.Module):
 
     def __init__(self, channels, hourglass, stack_num, group_res_num, heatmap_dimensions):
         """
-
         :param channels: 输入的通道数量
         :param hourglass: 创建好的沙漏网络
         :param heatmap_dimensions: 输出几维度的Heatmap
@@ -280,23 +294,27 @@ class ConnectedHourglass(nn.Module):
     def forward(self, x):
         """
         沙漏堆叠的前向传播稍微复杂
-
         :param x:
         :return: out
         """
-        out = []
+        out = torch.Tensor()
         # print(f"[DEBUG] 堆叠网络收到了 {x.shape} 大小的数据")
         # assert len(x.shape) == 4, ValueError("输入大小需为 [N, C, W, H]")
         # assert x.shape[1] == 3, ValueError("输入通道数需为 3 [N, C, W, H]")
         x = self.top(x)
-
+        ic(x.shape)
         for i, head in enumerate(self.loop_head):
             # 遍历全部的循环节
             # 每一个循环节会生成一个Heatmap
+            ic("HG输入", x.shape)
             origin = head(x)
+            ic("HG输出", origin.shape)
+
             heatmap = self.origin_to_heatmap_chc[i](origin)
+            # ic(self.origin_to_data_chc[i](origin).shape, self.heatmap_to_data_chc[i](heatmap).shape)
             data = self.origin_to_data_chc[i](origin) + self.heatmap_to_data_chc[i](heatmap)
-            out.append(heatmap)
+
+            out = torch.stack((out, heatmap))
             x += data
 
         return out
@@ -320,30 +338,34 @@ def make_connected_hourglass(channels, group_res_num, nesting_times, heatmap_dim
     return ConnectedHourglass(channels, hourglass, stack_num, group_res_num, heatmap_dimensions)
 
 
+class HeatmapLoss(nn.Module):
+    """
+    Heatmap损失函数
 
-def train(model, dataset):
-    pass
+    """
+
+    def __init__(self):
+        super(HeatmapLoss, self).__init__()
+
+
+def test_train():
+    from torch.optim import SGD
+
+    print("训练测试开始")
+    model = make_connected_hourglass(16, 4, 2, 1, 2)
+    x = torch.rand((1, 3, 256, 256))
+    y = torch.rand([1, 2, 1, 64, 64])
+    out = model(x)
+    optim = SGD(model.parameters(), lr=0.001, momentum=0.8)
+    lossfunc = nn.MSELoss()
+    ic(out.shape)
+    loss = lossfunc(out, y)
+    optim.zero_grad()
+    loss.backward()
+    optim.step()
 
 
 if __name__ == '__main__':
-    from cv2 import cv2
-    import time
-
-    small_hourglass = make_connected_hourglass(16, 1, 1, 1, 1)
-    img = cv2.imread("./demo.jpg")
-    img.resize((200, 200, 3))
-    x = torch.Tensor(img)
-    x = x.reshape(1, 3, 200, 200)
-
-    print("测试导出onnx")
-    torch.onnx.export(small_hourglass, x, 'small_hourglass.onnx', verbose=True)
-    #
-    print(f"输入内容的size为 {x.shape}")
-    # small_hourglass()
-    y = small_hourglass(x)
-    
-    for h in y:
-        print(f"输出Heatmap的size为 {h.shape}")
-        cv2.imshow('cvt', h.reshape((50, 50, 1)).detach().numpy())
-        print(h.shape)
-    cv2.waitKey(0)
+    # TODO: 逐步debug model
+    with torch.autograd.detect_anomaly():
+        test_train()
