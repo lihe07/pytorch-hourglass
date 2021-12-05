@@ -46,3 +46,11 @@ pytorch == 1.10
 由于Hourglass头部会对输入特征图执行下采样，导致 __长宽减半__。
 
 因此请确保输入图片的 __长宽__ 可以被 __2 ^ nesting_times__ 整除。
+
+## 训练
+
+StackedHourglass模型输出一个列表。其中包含了每一个Hourglass的Heatmap。
+
+调用stacked_hourglass.loss( 模型输出，标签数据 )，可以获得一个列表，包含每一个Hourglass的loss。
+
+可以将它们加在一起，获取总loss并backward。
