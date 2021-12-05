@@ -8,8 +8,7 @@ By @lihe07 2021.11.22
 
 import torch
 from torch import nn
-
-from icecream import ic
+from copy import deepcopy
 
 
 # Concepts
@@ -228,7 +227,7 @@ skip |   -> [ res_block(channels, channels) * n ]
         return self.main_route(x) + self.skipper(x)
 
 
-class ConnectedHourglass(nn.Module):
+class StackedHourglass(nn.Module):
     """
     叠在一起的沙漏模型
     Data [3] -> ReluConv(7, 2, 3) -> Data [64]
@@ -256,7 +255,7 @@ class ConnectedHourglass(nn.Module):
         :param hourglass: 创建好的沙漏网络
         :param heatmap_dimensions: 输出几维度的Heatmap
         """
-        super(ConnectedHourglass, self).__init__()
+        super(StackedHourglass, self).__init__()
         self.top = nn.Sequential(
             make_relu_conv(3, 64, 7, 2, 3),
             make_res_block(64, 128),
@@ -264,17 +263,18 @@ class ConnectedHourglass(nn.Module):
             make_res_block(128, 128),
             make_res_block(128, channels)
         )
-
+        self.stack_num = stack_num
         # 循环节的前部分
         # Contains hourglass + res_group + relu_conv
         self.loop_head = nn.ModuleList([
             nn.Sequential(
-                hourglass,
+                deepcopy(hourglass),
                 make_res_group(channels, group_res_num),
                 make_relu_conv(channels, channels)
             )
             for _ in range(stack_num)
         ])
+
         # 接受原始输出生成Heatmap的ChC
         self.origin_to_heatmap_chc = nn.ModuleList([
             make_channel_controller(channels, heatmap_dimensions)
@@ -283,13 +283,15 @@ class ConnectedHourglass(nn.Module):
         # 接受原始输出生成Data一部分的ChC
         self.origin_to_data_chc = nn.ModuleList([
             make_channel_controller(channels, channels)
-            for _ in range(stack_num)
+            for _ in range(stack_num - 1)
         ])
         # 接受Heatmap,生成Data一部分的ChC
         self.heatmap_to_data_chc = nn.ModuleList([
             make_channel_controller(heatmap_dimensions, channels)
-            for _ in range(stack_num)
+            for _ in range(stack_num - 1)
         ])
+        # for training
+        self.heatmap_loss = nn.MSELoss()
 
     def forward(self, x):
         """
@@ -297,30 +299,33 @@ class ConnectedHourglass(nn.Module):
         :param x:
         :return: out
         """
-        out = torch.Tensor()
-        # print(f"[DEBUG] 堆叠网络收到了 {x.shape} 大小的数据")
-        # assert len(x.shape) == 4, ValueError("输入大小需为 [N, C, W, H]")
-        # assert x.shape[1] == 3, ValueError("输入通道数需为 3 [N, C, W, H]")
+        out = []
         x = self.top(x)
-        ic(x.shape)
-        for i, head in enumerate(self.loop_head):
+        for i in range(self.stack_num):
             # 遍历全部的循环节
             # 每一个循环节会生成一个Heatmap
-            ic("HG输入", x.shape)
-            origin = head(x)
-            ic("HG输出", origin.shape)
+            origin = self.loop_head[i](x)
 
             heatmap = self.origin_to_heatmap_chc[i](origin)
             # ic(self.origin_to_data_chc[i](origin).shape, self.heatmap_to_data_chc[i](heatmap).shape)
-            data = self.origin_to_data_chc[i](origin) + self.heatmap_to_data_chc[i](heatmap)
-
-            out = torch.stack((out, heatmap))
-            x += data
+            out.append(heatmap)
+            if i < self.stack_num - 1:
+                # 最后一层不用叠加
+                x = x + self.origin_to_data_chc[i](origin) + self.heatmap_to_data_chc[i](heatmap)
 
         return out
 
+    def loss(self, model_out, label):
+        """
+        计算每一层Heatmap的loss
+        """
+        layer_losses = []
+        for heatmap in model_out:
+            layer_losses.append(self.heatmap_loss(heatmap, label))
+        return layer_losses
 
-def make_connected_hourglass(channels, group_res_num, nesting_times, heatmap_dimensions, stack_num, pool_kernel=2,
+
+def make_stacked_hourglass(channels, group_res_num, nesting_times, heatmap_dimensions, stack_num, pool_kernel=2,
                              pool_stride=2, enlarger_kernel=2):
     """
     制造一个叠起来的沙漏
@@ -335,37 +340,28 @@ def make_connected_hourglass(channels, group_res_num, nesting_times, heatmap_dim
     :return: 一个沙漏网络
     """
     hourglass = Hourglass(channels, group_res_num, nesting_times, pool_kernel, pool_stride, enlarger_kernel)
-    return ConnectedHourglass(channels, hourglass, stack_num, group_res_num, heatmap_dimensions)
-
-
-class HeatmapLoss(nn.Module):
-    """
-    Heatmap损失函数
-
-    """
-
-    def __init__(self):
-        super(HeatmapLoss, self).__init__()
+    return StackedHourglass(channels, hourglass, stack_num, group_res_num, heatmap_dimensions)
 
 
 def test_train():
+    """
+    测试训练
+    """
     from torch.optim import SGD
-
+    from icecream import ic
     print("训练测试开始")
-    model = make_connected_hourglass(16, 4, 2, 1, 2)
+    model = make_stacked_hourglass(16, 4, 2, 1, 2)
     x = torch.rand((1, 3, 256, 256))
-    y = torch.rand([1, 2, 1, 64, 64])
+    y = torch.rand([1, 1, 64, 64])
     out = model(x)
+    ic(out[0].shape)
     optim = SGD(model.parameters(), lr=0.001, momentum=0.8)
-    lossfunc = nn.MSELoss()
-    ic(out.shape)
-    loss = lossfunc(out, y)
+
+    loss = model.loss(out, y)
     optim.zero_grad()
-    loss.backward()
+    loss_sum = 0
+    for lo in loss:
+        loss_sum += lo
+    loss_sum.backward()
     optim.step()
 
-
-if __name__ == '__main__':
-    # TODO: 逐步debug model
-    with torch.autograd.detect_anomaly():
-        test_train()
